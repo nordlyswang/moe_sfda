@@ -6,7 +6,6 @@ from torchvision.datasets import ImageFolder
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-import ttach as tta
 import numpy as np
 
 # 定义设备
@@ -20,14 +19,6 @@ test_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-
-tta_transforms = tta.Compose(
-    [
-        tta.HorizontalFlip(),
-        tta.VerticalFlip(),
-        tta.Rotate90(angles=[0, 90,180]),
-    ]
-)
 
 test_dataset = ImageFolder(root=test_dir, transform=test_transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
@@ -58,7 +49,11 @@ class Gating(nn.Module):
         x = self.layer3(x)
         x = self.leaky_relu2(x)
         x = self.dropout3(x)
-        return torch.softmax(self.layer4(x), dim=1)
+        # return torch.softmax(self.layer4(x), dim=1)
+        weights = torch.softmax(self.layer4(x), dim=1)
+
+        noise = torch.randn_like(weights) * 0.01
+        return torch.softmax(weights + noise, dim=1)
 
 class MoE(nn.Module):
     def __init__(self, trained_experts):
@@ -77,7 +72,7 @@ class MoE(nn.Module):
         weights = weights.unsqueeze(1).expand_as(outputs)
         
         # 聚合专家输出
-        return torch.sum(outputs * weights, dim=2)
+        return torch.sum(outputs * weights, dim=2), weights
 
 # 加载训练好的专家模型
 def load_experts():
@@ -101,7 +96,89 @@ def load_moe_model():
     moe_model.load_state_dict(torch.load('./checkpoints/moe.pth')['model'])
     return moe_model
 
-# 计算模型准确率
+# 计算熵
+def calculate_entropy(weights):
+    """
+    计算门控网络权重的熵
+    参数:
+        weights: [batch_size, num_experts] 的权重分布
+    返回:
+        平均熵 (batch 内)
+    """
+    entropy = -torch.sum(weights * torch.log(weights + 1e-8), dim=1)  # 避免 log(0)
+    return entropy.mean()  # 返回批量样本的平均熵
+
+# 测试时间适应 (TTA) - 最小化熵约束
+def test_time_adaptation(model, images, num_adaptation_steps=50, lr=0.5):
+    """
+    在测试时间引入熵约束，通过调整模型的门控网络权重进行适应。
+    """
+    model.eval()
+
+    # 确保仅优化门控网络的参数
+    for param in model.experts.parameters():
+        param.requires_grad = False
+    for param in model.gating.parameters():
+        param.requires_grad = True
+
+    optimizer = torch.optim.SGD(model.gating.parameters(), lr=lr)
+
+    for step in range(num_adaptation_steps):
+        with torch.enable_grad():
+            optimizer.zero_grad()
+            
+            # 前向传播
+            _, weights = model(images)
+            entropy = calculate_entropy(weights)
+
+            # 调试信息
+            print(f"Step {step+1}, Entropy: {entropy.item()}, Weights Mean: {weights.mean().item()}")
+            
+            # 放大熵以增强梯度更新
+            loss = entropy * 1e6
+
+            # 加入正则化约束
+            l2_regularization = torch.sum(weights ** 2)
+            loss += 0.01 * l2_regularization
+
+            # 优化
+            loss.backward()
+            optimizer.step()
+
+    # 返回调整后的预测
+    with torch.no_grad():
+        outputs, _ = model(images)
+    return outputs
+
+
+
+# 评估MoE模型，带TTA
+def evaluate_model_with_tta(model, test_loader, num_adaptation_steps=10, lr=0.5):
+    model.eval()
+    correct = 0
+    total = 0
+    all_labels = []
+    all_preds = []
+    total_entropy = 0
+
+    with torch.no_grad():
+        for images, labels in tqdm(test_loader):
+            images, labels = images.to(device), labels.to(device)
+            outputs = test_time_adaptation(model, images, num_adaptation_steps, lr)
+            _, predicted = torch.max(outputs, 1)
+
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            all_labels.extend(labels.cpu().numpy())
+            all_preds.extend(predicted.cpu().numpy())
+
+            _, weights = model(images)
+            total_entropy += calculate_entropy(weights).item()
+
+    accuracy = 100 * correct / total
+    avg_entropy = total_entropy / len(test_loader)
+    return accuracy, avg_entropy, all_labels, all_preds
+
 def evaluate_model(model, test_loader):
     model.eval()
     correct = 0
@@ -124,7 +201,6 @@ def evaluate_model(model, test_loader):
     accuracy = 100 * correct / total
     return accuracy, all_labels, all_preds
 
-# 测试每个专家模型的准确率
 def evaluate_experts(experts, test_loader):
     expert_accuracies = {}
     all_labels = []
@@ -143,37 +219,30 @@ def evaluate_experts(experts, test_loader):
 
 # 主测试代码
 if __name__ == '__main__':
-    # 加载MoE模型
+    # 加载 MoE 模型
     moe_model = load_moe_model()
-    
+
     # 加载专家模型
     experts = load_experts()
-    tta_model = tta.ClassificationTTAWrapper(moe_model, tta_transforms)
-    
-    # 评估MoE模型
-    print("Evaluating MoE Model on Test Set...")
-    moe_accuracy, moe_labels, moe_preds = evaluate_model(moe_model, test_loader)
-    print(f"MoE Model Test Accuracy: {moe_accuracy:.2f}%")
-    
-    # 打印MoE分类报告和混淆矩阵
-    print("MoE Classification Report:")
+
+    # 评估专家模型
+    print("\nEvaluating Experts...")
+    expert_accuracies, _, _ = evaluate_experts(experts, test_loader)
+    for expert, accuracy in expert_accuracies.items():
+        print(f"{expert} Accuracy: {accuracy:.2f}%")
+
+    # 评估 MoE 模型 (带 TTA 和熵约束)
+    print("\nEvaluating MoE Model with TTA...")
+    moe_accuracy, moe_avg_entropy, moe_labels, moe_preds = evaluate_model_with_tta(
+        moe_model, test_loader, num_adaptation_steps=10, lr=0.5
+    )
+    print(f"MoE Model Test Accuracy with TTA: {moe_accuracy:.2f}%")
+    print(f"MoE Model Average Entropy with TTA: {moe_avg_entropy:.4f}")
+
+    # 打印分类报告和混淆矩阵
+    print("MoE Classification Report with TTA:")
     print(classification_report(moe_labels, moe_preds, target_names=class_names))
     cm = confusion_matrix(moe_labels, moe_preds)
     disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
     disp.plot(cmap=plt.cm.Blues)
     plt.show()
-
-    # 评估每个专家的准确率
-    expert_accuracies, expert_labels, expert_preds = evaluate_experts(experts, test_loader)
-    print("\nExpert Accuracies:")
-    for expert, accuracy in expert_accuracies.items():
-        print(f"{expert} Accuracy: {accuracy:.2f}%")
-    
-    # 打印每个专家的分类报告和混淆矩阵
-    for i, expert in enumerate(experts, start=1):
-        print(f"Expert {i} Classification Report:")
-        print(classification_report(expert_labels, expert_preds, target_names=class_names))
-        cm = confusion_matrix(expert_labels, expert_preds)
-        disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=class_names)
-        disp.plot(cmap=plt.cm.Blues)
-        plt.show()

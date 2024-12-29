@@ -1,16 +1,14 @@
 import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import models, transforms
+from torch import nn
+from torchvision import transforms
 from torchvision.datasets import ImageFolder
-import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+from sklearn.metrics import classification_report
 from tqdm import tqdm
-import numpy as np
-from sklearn.metrics import confusion_matrix, classification_report, ConfusionMatrixDisplay
-import seaborn as sns
-from moe import *
+from utils import *
+from moe import MoE
 
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 train_dir = './datasets/brain_tumor_detection/figshare/Training'
 test_dir = './datasets/brain_tumor_detection/figshare/Testing'
 
@@ -36,41 +34,7 @@ val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
 class_names = train_dataset.classes
 print(f"Classes: {class_names}")
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 criterion = nn.CrossEntropyLoss()
-
-
-def train_model(model, criterion, optimizer, train_loader, val_loader, save_path, num_epochs=10):
-    train_losses = []
-    val_accuracies = []
-    
-    for epoch in range(num_epochs):
-        model.train()
-        running_loss = 0.0
-        
-        for images, labels in tqdm(train_loader):
-            
-            images, labels = images.to(device), labels.to(device)
-            
-            optimizer.zero_grad()
-            
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss.item()
-
-        train_losses.append(running_loss / len(train_loader))
-        val_accuracy = evaluate_model(model, val_loader, log=False)
-        val_accuracies.append(val_accuracy)
-        
-        print(f"Epoch [{epoch+1}/{num_epochs}], Training Loss: {train_losses[-1]:.4f}, Validation Accuracy: {val_accuracy:.2f}%")
-    
-    torch.save({'model': model.state_dict()}, f'./checkpoints/{save_path}.pth')
-
-    return train_losses, val_accuracies
 
 def train_moe(model, criterion, optimizer, train_loader, val_loader, save_path, num_epochs=10):
     train_losses = []
@@ -130,25 +94,8 @@ def evaluate_model(model, val_loader, log=True):
     
     return accuracy
 
-expert1 = models.densenet121(pretrained=True).to(device)
-expert1.classifier = nn.Linear(expert1.classifier.in_features, 4).to(device)
-expert2 = models.densenet161(pretrained=True).to(device)
-expert2.classifier = nn.Linear(expert2.classifier.in_features, 4).to(device)
-expert3 = models.densenet201(pretrained=True).to(device)
-expert3.classifier = nn.Linear(expert3.classifier.in_features, 4).to(device)
-
-optimizer_expert1 = optim.Adam(expert1.parameters(), lr=0.001)
-optimizer_expert2 = optim.Adam(expert2.parameters(), lr=0.001)
-optimizer_expert3 = optim.Adam(expert3.parameters(), lr=0.001)
-
-print("Training Expert 1")
-train_model(expert1, criterion, optimizer_expert1, train_loader, val_loader, save_path='expert1', num_epochs=20)
-print("Training Expert 2")
-train_model(expert2, criterion, optimizer_expert2, train_loader, val_loader, save_path='expert2', num_epochs=20)
-print("Training Expert 3")
-train_model(expert3, criterion, optimizer_expert3, train_loader, val_loader, save_path='expert3', num_epochs=20)
-
-moe_model = MoE([expert1, expert2, expert3]).to(device)
-optimizer_moe = optim.Adam(moe_model.parameters(), lr=0.001)
-print("Training MoE")
-train_moe(moe_model, criterion, optimizer_moe, train_loader, val_loader, save_path='moe', num_epochs=20)
+if __name__ == '__main__':
+    experts = load_experts()
+    moe_model = MoE(experts).to(device)
+    optimizer = torch.optim.Adam(moe_model.parameters(), lr=0.001)
+    train_moe(moe_model, criterion, optimizer, train_loader, val_loader, 'moe', num_epochs=10)
